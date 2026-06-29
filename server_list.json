@@ -1,0 +1,12 @@
+{
+  "groups": [
+    {
+      "name": "Production",
+      "servers": [
+        { "name": "vm", "host": "192.168.1.106", "user": "vm", "port": 22 },
+        { "name": "db-01", "host": "192.168.1.20", "user": "admin", "port": 22 },
+        { "name": "cache-01", "host": "192.168.1.30", "user": "admin", "port": 22 }
+      ]
+    }
+  ]
+}
