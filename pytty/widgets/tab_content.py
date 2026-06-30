@@ -12,12 +12,14 @@ from pytty.widgets.log_highlighter import LogHighlighter
 
 
 class TabSessionClosed(Message):
+    """Sent when an SSH session tab is closed."""
     def __init__(self, tab_id: str) -> None:
         self.tab_id = tab_id
         super().__init__()
 
 
 class ServerTabContent(Widget):
+    """Widget managing an individual SSH session terminal interface."""
     DEFAULT_CSS = """
     ServerTabContent {
         layout: vertical;
@@ -42,11 +44,11 @@ class ServerTabContent(Widget):
         self.ssh = SSHManager(host, port, user)
         self.highlighter = LogHighlighter()
         self.tab_id: str | None = None
-        self._log_lines: list[str] = []
+        self.text_buffer = Text()
 
     def compose(self):
         with VerticalScroll(id="session-log"):
-            yield Static(id="log-output", markup=True)
+            yield Static(id="log-output")
         yield Input(id="command-input", placeholder="Type command and press Enter...")
 
     def on_mount(self):
@@ -57,12 +59,18 @@ class ServerTabContent(Widget):
         self._append_log(f"[bold]Connecting to {self.user}@{self.host}:{self.port}...[/]")
         self.run_worker(self._ssh_task(), name=f"ssh-{id(self)}", exclusive=True, exit_on_error=False)
 
-    def _append_log(self, text: str) -> None:
-        self._log_lines.append(text)
-        self.log_output.update("\n".join(self._log_lines))
+    def _append_log(self, text: str | Text) -> None:
+        """Appends plain markup string or a rich Text object to the terminal buffer."""
+        if isinstance(text, str):
+            self.text_buffer.append(Text.from_markup(text + "\n"))
+        else:
+            self.text_buffer.append(text)
+        
+        self.log_output.update(self.text_buffer)
         self.log_scroll.scroll_end(animate=False)
 
     async def _ssh_task(self):
+        """Worker task handling the SSH connection lifecycle."""
         try:
             self._append_log("[bold]Establishing SSH transport...[/]")
             connect_task = asyncio.create_task(self.ssh.connect())
@@ -75,77 +83,52 @@ class ServerTabContent(Widget):
             self.inp.disabled = False
             self.inp.focus()
             self._append_log(f"[bold green]Connected to {self.server_name}[/]")
+            
+            # Send initial return to trigger the first prompt display
             asyncio.create_task(self.ssh.write("\r"))
             await self.ssh.read_loop(self._on_ssh_output)
         except asyncio.CancelledError:
             pass
         except TimeoutError:
-            self._append_log(
-                f"[bold red]Connection to {self.user}@{self.host}:{self.port} TIMED OUT[/]"
-            )
-            self._append_log(
-                "[dim]Host did not respond within 10s. Check IP/port and network connectivity.[/]"
-            )
-            self._append_log(
-                "[dim]TIP: Try 'ping' to check if host is reachable.[/]"
-            )
+            self._append_log(f"[bold red]Connection to {self.user}@{self.host}:{self.port} TIMED OUT[/]")
         except OSError as e:
-            self._append_log(
-                f"[bold red]Cannot reach {self.user}@{self.host}:{self.port}[/]"
-            )
+            self._append_log(f"[bold red]Cannot reach {self.user}@{self.host}:{self.port}[/]")
             self._append_log(f"[red]OS Error ({type(e).__name__}): {e}[/]")
-            self._append_log(
-                "[dim]TIP: Check if SSH agent is running (ssh-add -l) and host is correct.[/]"
-            )
         except ConnectionError as e:
-            self._append_log(
-                f"[bold red]Connection refused by {self.user}@{self.host}:{self.port}[/]"
-            )
-            self._append_log(f"[red]{type(e).__name__}: {e}[/]")
-            self._append_log(
-                "[dim]TIP: Make sure SSH server is running and key is loaded (ssh-add -l).[/]"
-            )
+            self._append_log(f"[bold red]Connection refused by {self.user}@{self.host}:{self.port}[/]")
         except asyncssh.PermissionDenied as e:
-            self._append_log(
-                f"[bold yellow]Authentication failed for {self.user}@{self.host}:{self.port}[/]"
-            )
+            self._append_log(f"[bold yellow]Authentication failed for {self.user}@{self.host}:{self.port}[/]")
             self._append_log(f"[red]{e}[/]")
-            self._append_log(
-                "[dim]TIP: Run 'ssh-add -l' to check loaded keys, "
-                "'ssh-keygen' to create a new key, "
-                "or 'ssh-copy-id {user}@{host}' to install your key on the server.[/]"
-            )
         except Exception as e:
-            self._append_log(
-                f"[bold red]Connection to {self.user}@{self.host}:{self.port} FAILED[/]"
-            )
+            self._append_log(f"[bold red]Connection to {self.user}@{self.host}:{self.port} FAILED[/]")
             self._append_log(f"[red]{type(e).__name__}: {e}[/]")
-            self._append_log(
-                "[dim]TIP: Verify connection details (IP, port, username) and network.[/]"
-            )
         finally:
             self.inp.disabled = True
             await self.ssh.close()
 
     def _on_ssh_output(self, data: str) -> None:
-        for line in data.rstrip("\n").split("\n"):
-            highlighted = self.highlighter.highlight(line)
-            if isinstance(highlighted, Text):
-                self._append_log(highlighted.markup)
-            else:
-                self._append_log(str(highlighted))
+        """Handles and formats raw incoming data chunks from the SSH session."""
+        # FIX: Interpret raw ANSI/VT100 escape codes (colors, weights) into Rich styles
+        ansi_interpreted_text = Text.from_ansi(data)
+        self._append_log(ansi_interpreted_text)
 
     def write_to_log(self, text: str) -> None:
+        """Writes a system log entry."""
         self._append_log(text)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        cmd = event.value.strip()
-        if cmd and self.ssh.is_connected:
-            self._append_log(f"[bold dim]{self.server_name}[/][bold]$ {cmd}[/]")
+        """Sends user commands to the SSH backend upon submission."""
+        cmd = event.value
+        
+        if self.ssh.is_connected:
+            # FIX: We don't log the command manually anymore. 
+            # The remote PTY will echo it back naturally along with the execution results.
             asyncio.create_task(self.ssh.write(cmd + "\r"))
+            
         event.input.value = ""
 
     def on_unmount(self):
+        """Cleans up the SSH connection when the widget is unmounted."""
         asyncio.create_task(self.ssh.close())
         if self.tab_id is not None:
             self.post_message(TabSessionClosed(self.tab_id))

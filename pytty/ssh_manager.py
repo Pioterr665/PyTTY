@@ -1,21 +1,5 @@
 import asyncio
-
 import asyncssh
-
-
-class _OutputCollector(asyncssh.SSHClientSession):
-    def __init__(self, queue: asyncio.Queue) -> None:
-        super().__init__()
-        self.queue = queue
-
-    def session_started(self) -> None:
-        self.queue.put_nowait(("session_started", None))
-
-    def data_received(self, data: bytes, datatype: int) -> None:
-        self.queue.put_nowait(("data", data.decode("utf-8", errors="replace")))
-
-    def connection_lost(self, exc: Exception | None) -> None:
-        self.queue.put_nowait(("closed", exc))
 
 
 class SSHManager:
@@ -24,11 +8,11 @@ class SSHManager:
         self.port = port
         self.user = user
         self._conn: asyncssh.SSHConnection | None = None
-        self._session: asyncssh.SSHSession | None = None
-        self._client: _OutputCollector | None = None
+        self._process: asyncssh.SSHClientProcess | None = None
         self._closed = False
 
     async def connect(self) -> None:
+        """Establish SSH connection and spawn a remote shell process."""
         self._conn = await asyncssh.connect(
             self.host,
             username=self.user,
@@ -36,41 +20,45 @@ class SSHManager:
             known_hosts=None,
             connect_timeout=10,
         )
-        queue: asyncio.Queue = asyncio.Queue()
-        self._session, self._client = await self._conn.create_session(
-            lambda: _OutputCollector(queue),
+        
+        # Allocate a PTY and start the default shell session
+        self._process = await self._conn.create_process(
             term_type="xterm-256color",
             term_size=(80, 24),
-            request_pty=True,
-            encoding=None,
         )
 
     async def read_loop(self, callback) -> None:
-        if self._client is None:
+        """Read output stream from the remote process and pass it to the callback."""
+        if self._process is None:
             return
+        
+        callback("\n[dim]Shell session started[/]")
+        
         while not self._closed:
-            msg = await self._client.queue.get()
-            kind, payload = msg[0], msg[1]
-            if kind == "data":
-                callback(payload)
-            elif kind == "session_started":
-                callback("\n[dim]Shell session started[/]")
-            elif kind == "closed":
-                if payload is not None:
-                    callback(f"\n[red]Session closed: {payload}[/]")
+            try:
+                # Read incoming data from stdout stream
+                data = await self._process.stdout.read(4096)
+                if not data:
+                    callback("\n[red]Session closed by remote host[/]")
+                    break
+                
+                callback(data)
+            except (asyncio.CancelledError, GeneratorExit):
+                break
+            except Exception as e:
+                callback(f"\n[red]Session error: {type(e).__name__}: {e}[/]")
                 break
 
     async def write(self, data: str) -> None:
-        if self._session and not self._session.is_closed():
-            self._session.write(data.encode())
+        """Write string data directly to the remote stdin process."""
+        if self._process and not self._process.is_closed():
+            self._process.write(data)
 
     async def close(self) -> None:
+        """Terminate the process and close the SSH transport connection."""
         self._closed = True
-        if self._client:
-            try:
-                self._client.queue.put_nowait(("closed", None))
-            except asyncio.QueueFull:
-                pass
+        if self._process:
+            self._process.close()
         if self._conn:
             self._conn.close()
             try:
@@ -80,4 +68,5 @@ class SSHManager:
 
     @property
     def is_connected(self) -> bool:
+        """Check if the connection is active."""
         return self._conn is not None and not self._conn.is_closed()
